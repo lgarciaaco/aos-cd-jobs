@@ -1,0 +1,86 @@
+#!/usr/bin/env groovy
+node {
+    timestamps {
+    checkout scm
+    def buildlib = load("pipeline-scripts/buildlib.groovy")
+    commonlib = buildlib.commonlib
+
+    commonlib.describeJob("cleanup-temp-files", """
+        ----------
+        Cleanup temporary files
+        ----------
+        Clean up temporary files that accumulate over time to free up disk space.
+        This includes build artifacts, cache files, and other temporary data.
+
+        Timing: Can be run manually or scheduled for regular maintenance.
+    """)
+
+    properties(
+        [
+            disableResume(),
+            buildDiscarder(logRotator(daysToKeepStr: '30')),
+            [
+                $class: 'ParametersDefinitionProperty',
+                parameterDefinitions: [
+                    commonlib.mockParam(),
+                    commonlib.artToolsParam(),
+                    string(
+                        name: "DRY_RUN",
+                        description: 'Set to "true" to preview files that would be cleaned without actually deleting them',
+                        defaultValue: 'false',
+                        trim: true,
+                    ),
+                    string(
+                        name: "MAX_AGE_DAYS",
+                        description: 'Maximum age in days for temporary files to be considered for cleanup',
+                        defaultValue: '7',
+                        trim: true,
+                    )
+                ]
+            ]
+        ]
+    )
+
+    // Check for mock build
+    commonlib.checkMock()
+
+    // Clean up temporary files
+    stage('cleanup-temp-files') {
+        buildlib.init_artcd_working_dir()
+        def cmd = [
+            "artcd",
+            "-v",
+            "--working-dir=./artcd_working",
+            "--config=./config/artcd.toml",
+            "cleanup-temp-files",
+        ]
+        
+        // Add parameters to command
+        if (params.DRY_RUN == 'true') {
+            cmd.add("--dry-run")
+        }
+        
+        if (params.MAX_AGE_DAYS) {
+            cmd.add("--max-age-days=${params.MAX_AGE_DAYS}")
+        }
+
+        withCredentials([
+                    string(credentialsId: 'redis-server-password', variable: 'REDIS_SERVER_PASSWORD'),
+                    string(credentialsId: 'jenkins-service-account', variable: 'JENKINS_SERVICE_ACCOUNT'),
+                    string(credentialsId: 'jenkins-service-account-token', variable: 'JENKINS_SERVICE_ACCOUNT_TOKEN')
+                ]) {
+            withEnv(["BUILD_URL=${BUILD_URL}", "JOB_NAME=${JOB_NAME}"]) {
+                try {
+                    sh(script: cmd.join(' '), returnStdout: true)
+                } catch (err) {
+                    throw err
+                } finally {
+                    commonlib.safeArchiveArtifacts([
+                        "artcd_working/**/*.log",
+                    ])
+                }
+            }
+        }
+    }
+    }
+}
