@@ -208,13 +208,10 @@ Build URL: ${BUILD_URL}
 
                 def shipmentCmd = ["doozer", "--group", golangGroup, "--working-dir", doozer_working]
                 if (params.DOOZER_DATA_PATH) {
-                    shipmentCmd += ["--data-path", "${params.DOOZER_DATA_PATH}"]
-                }
-                if (params.DOOZER_DATA_GITREF) {
-                    shipmentCmd += ["--data-gitref", "${params.DOOZER_DATA_GITREF}"]
-                }
-                if (params.DRY_RUN) {
-                    shipmentCmd << "--dry-run"
+                    def dataPath = params.DOOZER_DATA_GITREF ?
+                        "${params.DOOZER_DATA_PATH}@${params.DOOZER_DATA_GITREF}" :
+                        params.DOOZER_DATA_PATH
+                    shipmentCmd += ["--data-path", dataPath]
                 }
                 shipmentCmd += ["golang-builder-shipment", env.BASE_IMAGE_RELEASE_NVR]
                 echo "Will run: ${shipmentCmd.join(' ')}"
