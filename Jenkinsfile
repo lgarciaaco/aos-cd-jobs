@@ -1,70 +1,236 @@
-// Update-branches job
+#!/usr/bin/env groovy
 
-properties(
-  [
-    disableConcurrentBuilds(),
-    disableResume(),
-    buildDiscarder(
-      logRotator(
-        artifactDaysToKeepStr: '60',
-        daysToKeepStr: '60')
-    ),
-  ]
-)
-
-// https://issues.jenkins-ci.org/browse/JENKINS-33511
-def set_workspace() {
-  if(env.WORKSPACE == null) {
-    env.WORKSPACE = WORKSPACE = pwd()
-  }
-}
-
-node('openshift-build-1') {
+node() {
     timestamps {
-  try {
-    timeout(time: 30, unit: 'MINUTES') {
-      deleteDir()
-      set_workspace()
-      dir('aos-cd-jobs') {
-        stage('clone') {
-          checkout scm
-          sh 'git checkout master'
+
+    checkout scm
+    def buildlib = load("pipeline-scripts/buildlib.groovy")
+    def commonlib = buildlib.commonlib
+
+    commonlib.describeJob("base-image-release", """
+        <h2>Release base images to base repository</h2>
+        <b>Timing</b>: This is only ever run by humans, as needed. No job should be calling it.
+
+        Supply exactly one Konflux IMAGE build <code>NVR</code> (SUCCESS row required for this group —
+        ART-18934 / art-tools). The job invokes <code>doozer images:release-to-base-repo</code>
+        once with singular <code>--nvr</code>.
+
+        For <code>rhel-*-golang-*</code> build groups, the job also runs
+        <code>doozer golang-builder-shipment</code> after release to create a shipment MR in
+        <code>ocp-shipment-data</code>.
+    """)
+
+    properties([
+        disableResume(),
+        buildDiscarder(
+          logRotator(
+              artifactDaysToKeepStr: '30',
+              daysToKeepStr: '30',
+              numToKeepStr: '300',
+          )
+        ),
+        [
+            $class: 'ParametersDefinitionProperty',
+            parameterDefinitions: [
+                commonlib.suppressEmailParam(),
+                commonlib.mockParam(),
+                string(
+                    name: 'BUILD_VERSION',
+                    description: 'Build group name (e.g., openshift-5.0 for OCP or rhel-9-golang-1.24 for golang builders)',
+                    defaultValue: "openshift-5.0",
+                    trim: true,
+                ),
+                commonlib.artToolsParam(),
+                string(
+                    name: 'ASSEMBLY',
+                    description: 'The name of an assembly to use.',
+                    defaultValue: "stream",
+                    trim: true,
+                ),
+                string(
+                    name: 'DOOZER_DATA_PATH',
+                    description: 'ocp-build-data fork to use (e.g. test customizations on your own fork)',
+                    defaultValue: "https://github.com/openshift-eng/ocp-build-data",
+                    trim: true,
+                ),
+                string(
+                    name: 'DOOZER_DATA_GITREF',
+                    description: '(Optional) Doozer data path git [branch / tag / sha] to use',
+                    defaultValue: "",
+                    trim: true,
+                ),
+                string(
+                    name: 'NVR',
+                    description: 'Exactly one Konflux IMAGE build NVR for this group (SUCCESS row required). Passed once to images:release-to-base-repo --nvr.',
+                    defaultValue: "",
+                    trim: true,
+                ),
+                booleanParam(
+                    name: 'DRY_RUN',
+                    description: 'When true, invoke doozer with global --dry-run. Snapshot/release semantics for images:release-to-base-repo depend on art-tools honoring that flag; confirm behavior before trusting it for risky runs.',
+                    defaultValue: false,
+                ),
+                booleanParam(
+                    name: 'SKIP_LEGACY_RELEASE',
+                    description: 'Skip the images:release-to-base-repo stage entirely. Use to test the golang-builder-shipment stage in isolation without triggering a real base-image release.',
+                    defaultValue: false,
+                ),
+            ],
+        ]
+    ])
+
+    commonlib.checkMock()
+
+    stage('Validate Parameters') {
+        if (!params.NVR?.trim()) {
+            error('NVR is required — exactly one Konflux IMAGE build NVR (no comma-separated lists; run this job separately per release).')
         }
-        stage('run') {
-          final url = sh(
-            returnStdout: true,
-            script: 'git config remote.origin.url')
-          if(!(url =~ /^[-\w]+@[-\w]+(\.[-\w]+)*:/)) {
-            error('This job uses ssh keys for auth, please use an ssh url')
-          }
-          def prune = true, key = 'openshift-bot'
-          if(url.trim() != 'git@github.com:openshift-eng/aos-cd-jobs.git') {
-            prune = false
-            key = "${(url =~ /.*:([^\/]+)/)[0][1]}-aos-cd-bot"
-          }
-          sshagent([key]) {
-            sh """\
-python3 -m venv ../env/
-. ../env/bin/activate
-pip install gitpython
-export GIT_PYTHON_TRACE=full
-${prune ? 'python -m aos_cd_jobs.pruner' : 'echo Fork, skipping pruner'}
-python -m aos_cd_jobs.updater
-"""
-          }
+        def trimmed = params.NVR.trim()
+        if (trimmed.contains(',')) {
+            error('Use a single NVR only; commas are not supported (spawn another job build for additional NVRs).')
         }
-      }
+        env.BASE_IMAGE_RELEASE_NVR = trimmed
+
+        echo("Single-NVR images:release-to-base-repo (--nvr) run.")
+        echo("Base Image Release Parameters:")
+        echo("  BUILD_VERSION: ${params.BUILD_VERSION}")
+        echo("  ASSEMBLY: ${params.ASSEMBLY}")
+        echo("  NVR: ${env.BASE_IMAGE_RELEASE_NVR}")
+        echo("  DRY_RUN: ${params.DRY_RUN}")
+
+        currentBuild.displayName = "${params.BUILD_VERSION} - ${env.BASE_IMAGE_RELEASE_NVR}"
+        if (params.DRY_RUN) {
+            currentBuild.displayName += " [DRY_RUN]"
+        }
     }
-  } catch(err) {
-    mail(
-      to: 'jupierce@redhat.com',
-      from: "aos-cicd@redhat.com",
-      subject: 'aos-cd-jobs-branches job: error',
-      body: """\
-Encountered an error while running the aos-cd-jobs-branches job: ${err}\n\n
-Jenkins job: ${env.BUILD_URL}
+
+    stage("Version dumps") {
+        buildlib.doozer "--version"
+        buildlib.elliott "--version"
+        buildlib.oc("version --client=true -o yaml")
+    }
+
+    stage("Release base image") {
+        doozer_working = "${env.WORKSPACE}/doozer_working"
+        buildlib.cleanWorkdir(doozer_working)
+
+        if (params.SKIP_LEGACY_RELEASE) {
+            echo "SKIP_LEGACY_RELEASE=true — skipping images:release-to-base-repo"
+        } else {
+        try {
+            def cmd = [
+                "doozer",
+                "--group", "${params.BUILD_VERSION}",
+                "--assembly", "${params.ASSEMBLY}"
+            ]
+
+            if (params.DOOZER_DATA_PATH) {
+                cmd += ["--data-path", "${params.DOOZER_DATA_PATH}"]
+            }
+
+            if (params.DOOZER_DATA_GITREF) {
+                cmd += ["--data-gitref", "${params.DOOZER_DATA_GITREF}"]
+            }
+
+            if (params.DRY_RUN) {
+                cmd << "--dry-run"
+            }
+
+            cmd << "images:release-to-base-repo" << "--nvr" << env.BASE_IMAGE_RELEASE_NVR
+
+            echo "Will run: ${cmd.join(' ')}"
+
+            dir(doozer_working) {
+                withCredentials([
+                    string(credentialsId: 'jenkins-service-account', variable: 'JENKINS_SERVICE_ACCOUNT'),
+                    string(credentialsId: 'jenkins-service-account-token', variable: 'JENKINS_SERVICE_ACCOUNT_TOKEN'),
+                    string(credentialsId: 'openshift-art-build-bot-app-id', variable: 'GITHUB_APP_ID'),
+                    file(credentialsId: 'openshift-art-build-bot-private-key.pem', variable: 'GITHUB_APP_PRIVATE_KEY_PATH'),
+                    file(credentialsId: 'konflux-gcp-app-creds-prod', variable: 'GOOGLE_APPLICATION_CREDENTIALS'),
+                    file(credentialsId: 'konflux-bot-0-ocp-art-tenant-sa', variable: 'KONFLUX_SA_KUBECONFIG'),
+                    file(credentialsId: 'konflux-bot-0-art-oadp-tenant-sa', variable: 'OADP_KONFLUX_SA_KUBECONFIG'),
+                    file(credentialsId: 'konflux-bot-0-art-mtc-tenant-sa', variable: 'MTC_KONFLUX_SA_KUBECONFIG'),
+                    file(credentialsId: 'konflux-bot-0-art-mta-tenant-sa', variable: 'MTA_KONFLUX_SA_KUBECONFIG'),
+                    file(credentialsId: 'konflux-bot-0-art-logging-tenant-sa', variable: 'LOGGING_KONFLUX_SA_KUBECONFIG'),
+                    file(credentialsId: 'konflux-bot-0-art-acm-tenant-sa', variable: 'ACM_KONFLUX_SA_KUBECONFIG'),
+                    file(credentialsId: 'konflux-bot-0-art-oap-tenant-sa', variable: 'OAP_KONFLUX_SA_KUBECONFIG'),
+                    file(credentialsId: 'quay-auth-file', variable: 'QUAY_AUTH_FILE'),
+                    usernamePassword(
+                        credentialsId: 'art-dash-db-login',
+                        passwordVariable: 'DOOZER_DB_PASSWORD',
+                        usernameVariable: 'DOOZER_DB_USER'
+                    ),
+                ]) {
+                    withEnv(['DOOZER_DB_NAME=art_dash', "BUILD_URL=${BUILD_URL}", "JOB_NAME=${JOB_NAME}"]) {
+                        sh(script: cmd.join(' '), returnStdout: true)
+                    }
+                }
+            }
+
+        } catch (err) {
+            commonlib.email(
+                    to: "aos-art-automation+failed-base-image-release@redhat.com",
+                    from: "aos-art-automation@redhat.com",
+                    replyTo: "aos-team-art@redhat.com",
+                    subject: "Error during base-image-release (NVR: ${env.BASE_IMAGE_RELEASE_NVR})",
+                    body: """
+There was an issue releasing a base image:
+
+    NVR: ${env.BASE_IMAGE_RELEASE_NVR}
+    Error: ${err}
+
+Build URL: ${BUILD_URL}
 """)
-    throw err
-  }
+            throw (err)
+        } finally {
+            commonlib.safeArchiveArtifacts([
+                "doozer_working/debug.log",
+                "doozer_working/**/*.log",
+                "doozer_working/**/*.json",
+            ])
+            buildlib.cleanWorkspace()
+        }
+        } // end else SKIP_LEGACY_RELEASE
+
+        stage("Golang builder shipment") {
+            if (env.BASE_IMAGE_RELEASE_NVR ==~ /openshift-golang-builder-container-.*/) {
+                echo "Detected golang builder NVR: ${env.BASE_IMAGE_RELEASE_NVR}"
+                // Derive group from NVR: openshift-golang-builder-container-v1.25.x-....el9 -> rhel-9-golang-1.25
+                def goMinorMatch = (env.BASE_IMAGE_RELEASE_NVR =~ /container-v(\d+\.\d+)\./)
+                def rhelMatch = (env.BASE_IMAGE_RELEASE_NVR =~ /\.el(\d+)/)
+                if (!goMinorMatch || !rhelMatch) {
+                    error("Cannot derive golang group from NVR: ${env.BASE_IMAGE_RELEASE_NVR}")
+                }
+                def goMinor = goMinorMatch[0][1]
+                def rhelNum = rhelMatch[0][1]
+                def golangGroup = "rhel-${rhelNum}-golang-${goMinor}"
+                echo "Derived golang group: ${golangGroup}"
+
+                def shipmentCmd = ["doozer", "--group", golangGroup, "--working-dir", doozer_working]
+                if (params.DOOZER_DATA_PATH) {
+                    shipmentCmd += ["--data-path", "${params.DOOZER_DATA_PATH}"]
+                }
+                if (params.DOOZER_DATA_GITREF) {
+                    shipmentCmd += ["--data-gitref", "${params.DOOZER_DATA_GITREF}"]
+                }
+                if (params.DRY_RUN) {
+                    shipmentCmd << "--dry-run"
+                }
+                shipmentCmd += ["golang-builder-shipment", env.BASE_IMAGE_RELEASE_NVR]
+                echo "Will run: ${shipmentCmd.join(' ')}"
+                withCredentials([
+                    string(credentialsId: 'art-bot-jenkins-gitlab', variable: 'GITLAB_TOKEN'),
+                    file(credentialsId: 'konflux-bot-0-ocp-art-tenant-sa', variable: 'KONFLUX_SA_KUBECONFIG'),
+                    file(credentialsId: 'quay-auth-file', variable: 'QUAY_AUTH_FILE'),
+                    file(credentialsId: 'konflux-gcp-app-creds-prod', variable: 'GOOGLE_APPLICATION_CREDENTIALS'),
+                ]) {
+                    sh(script: shipmentCmd.join(' '))
+                }
+            } else {
+                echo "Not a golang builder NVR, skipping shipment MR creation"
+            }
+        }
+    }
+
     }
 }
