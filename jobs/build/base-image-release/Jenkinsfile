@@ -14,6 +14,10 @@ node() {
         Supply exactly one Konflux IMAGE build <code>NVR</code> (SUCCESS row required for this group —
         ART-18934 / art-tools). The job invokes <code>doozer images:release-to-base-repo</code>
         once with singular <code>--nvr</code>.
+
+        For <code>rhel-*-golang-*</code> build groups, the job also runs
+        <code>artcd golang-builder-shipment</code> after release to create a shipment MR in
+        <code>ocp-shipment-data</code>.
     """)
 
     properties([
@@ -152,6 +156,32 @@ node() {
                     withEnv(['DOOZER_DB_NAME=art_dash', "BUILD_URL=${BUILD_URL}", "JOB_NAME=${JOB_NAME}"]) {
                         sh(script: cmd.join(' '), returnStdout: true)
                     }
+                }
+            }
+
+            stage("Golang builder shipment") {
+                if (params.BUILD_VERSION ==~ /rhel-\d+-golang-.+/) {
+                    echo "Detected golang builder group: ${params.BUILD_VERSION}"
+                    def shipmentCmd = [
+                        "artcd",
+                        "--working-dir", doozer_working,
+                    ]
+                    if (params.DRY_RUN) {
+                        shipmentCmd << "--dry-run"
+                    }
+                    shipmentCmd += [
+                        "golang-builder-shipment",
+                        "--golang-group", params.BUILD_VERSION,
+                        env.BASE_IMAGE_RELEASE_NVR,
+                    ]
+                    echo "Will run: ${shipmentCmd.join(' ')}"
+                    withCredentials([
+                        string(credentialsId: 'art-bot-jenkins-gitlab', variable: 'GITLAB_TOKEN'),
+                    ]) {
+                        sh(script: shipmentCmd.join(' '))
+                    }
+                } else {
+                    echo "Not a golang builder group, skipping shipment MR creation"
                 }
             }
 
